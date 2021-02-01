@@ -604,6 +604,7 @@ class ODViewer(param.Parameterized):
             self.date_slider,
         )
 
+
 class TripSegmentation(param.Parameterized):
 
     device_selector = param.ObjectSelector(label='Select a Device')
@@ -628,20 +629,17 @@ class TripSegmentation(param.Parameterized):
         # process the source files to get the trip table
         self.process_trajectories()
 
-
     def reset_device_dropdown(self):
         # get the list of unique devices
         device_list = self.trip_table["device_id"].unique()
         self.param.device_selector.objects = device_list
         self.device_selector = device_list[0]
 
-
     @param.depends('action', watch=True)
     def process_trajectories(self):
-
-        self.trip_table = split_trajectories(self.source_data, max_diameter=self.max_diameter,  min_duration=timedelta(minutes=self.min_duration), gap=timedelta(minutes=self.gap))
+        tc = split_trajectories(self.source_data, max_diameter=self.max_diameter,  min_duration=timedelta(minutes=self.min_duration), gap=timedelta(minutes=self.gap))
+        self.trip_table = extract_traj_info(tc)
         self.reset_device_dropdown()
-
 
     @param.depends('device_selector')
     def view_device_trips(self):
