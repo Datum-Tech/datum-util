@@ -637,8 +637,8 @@ class TripSegmentation(param.Parameterized):
 
     @param.depends('action', watch=True)
     def process_trajectories(self):
-        tc = split_trajectories(self.source_data, max_diameter=self.max_diameter,  min_duration=timedelta(minutes=self.min_duration), gap=timedelta(minutes=self.gap))
-        self.trip_table = extract_traj_info(tc)
+        self.tc = split_trajectories(self.source_data, max_diameter=self.max_diameter,  min_duration=timedelta(minutes=self.min_duration), gap=timedelta(minutes=self.gap))
+        self.trip_table = extract_traj_info(self.tc)
         self.reset_device_dropdown()
 
     @param.depends('device_selector')
