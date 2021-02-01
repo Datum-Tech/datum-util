@@ -1,24 +1,32 @@
 """Transportation analysis utilities."""
 
-from .geohash import geohash_encode_point, geohash_to_box
 import datetime as dt
+import logging
 from copy import deepcopy
 from datetime import timedelta
+from typing import Dict
 
+import cartopy.crs as ccrs
 import colorcet as cc
+import dask.dataframe as dd
 import geopandas as gpd
+import geoviews as gv
 import holoviews as hv
+import hvplot.pandas
 import movingpandas as mpd
 import pandas as pd
 import panel as pn
-import hvplot.pandas
 import param
 import spatialpandas as spd
-from spatialpandas.io import read_parquet_dask
+from cartopy import crs
+from geohash import bbox
 from geoviews import tile_sources as gvts
-import cartopy.crs as ccrs
-import geoviews as gv
+from shapely.geometry import Polygon, box
+from spatialpandas.io import read_parquet, read_parquet_dask, to_parquet
 
+from .file_io import exists
+from .geohash import geohash_decode_point, geohash_encode_point, geohash_to_box
+from .typing import PathType
 
 COLORMAP = deepcopy(cc.CET_L16[::-1])
 
@@ -28,7 +36,7 @@ def split_trajectories(
     max_diameter: int,
     min_duration: timedelta,
     gap: timedelta,
-) -> spd.GeoDataFrame:
+) -> mpd.TrajectoryCollection:
     """Split trajectories."""
     gdf = gpd.GeoDataFrame(
         df.reset_index().set_index("timestamp"),
@@ -41,27 +49,36 @@ def split_trajectories(
         min_duration=min_duration,
     )
     all_stops = mpd.ObservationGapSplitter(stops).split(gap=gap)
+    return all_stops
+
+
+def extract_traj_info(tc: mpd.TrajectoryCollection) -> spd.GeoDataFrame:
+    """Extract trajectory information from collection."""
     dfs = []
-    for traj in all_stops.trajectories:
+    for traj in tc.trajectories:
         traj_df = traj.df
-        traj_df["traj_id"] = (traj.get_start_time().isoformat() + "-" +
-                              traj.df.device_id.iloc[0])
+        traj_df["traj_id"] = (
+            traj.get_start_time().isoformat() + "-" + traj.df.device_id.iloc[0]
+        )
         dfs.append(traj_df)
     if not dfs:
-        raise ValueError(f"No trajectories found, number points: {len(df)}")
+        raise ValueError(f"No trajectories found.")
     traj_dfs = pd.concat(dfs).to_crs("EPSG:2845")
     traj_collection = mpd.TrajectoryCollection(traj_dfs, "traj_id")
-    data = [(
-        traj.id,
-        traj.to_linestring(),
-        traj.get_direction(),
-        traj.get_duration(),
-        traj.get_length(),
-        traj.get_start_time(),
-        traj.get_end_time(),
-        traj.get_start_location(),
-        traj.get_end_location(),
-    ) for traj in traj_collection.trajectories]
+    data = [
+        (
+            traj.id,
+            traj.to_linestring(),
+            traj.get_direction(),
+            traj.get_duration(),
+            traj.get_length() / 1609.34,  # convert from m to mi
+            traj.get_start_time(),
+            traj.get_end_time(),
+            traj.get_start_location(),
+            traj.get_end_location(),
+        )
+        for traj in traj_collection.trajectories
+    ]
     data = gpd.GeoDataFrame(
         data,
         columns=[
@@ -77,17 +94,202 @@ def split_trajectories(
         ],
     )
     data["device_id"] = data.traj_id.str.split("-").str[-1]
-    data["duration"] = data.duration.dt.seconds
-    data["start_geohash"] = (gpd.GeoDataFrame(
-        dict(geometry=data.start_location)).set_crs("EPSG:2845").to_crs(
-            "EPSG:4326").geometry.apply(geohash_encode_point))
-    data["end_geohash"] = (gpd.GeoDataFrame(
-        dict(geometry=data.end_location)).set_crs("EPSG:2845").to_crs(
-            "EPSG:4326").geometry.apply(geohash_encode_point))
+    data["duration"] = data.duration.dt.seconds / 60
+    data["start_location"] = (
+        gpd.GeoDataFrame(dict(geometry=data.start_location))
+        .set_crs("EPSG:2845")
+        .to_crs("EPSG:4326")
+    )
+    data["start_geohash"] = data["start_location"].apply(geohash_encode_point)
+    data["end_location"] = (
+        gpd.GeoDataFrame(dict(geometry=data.end_location))
+        .set_crs("EPSG:2845")
+        .to_crs("EPSG:4326")
+    )
+    data["end_geohash"] = data["end_location"].apply(geohash_encode_point)
+    data = pd.concat(
+        [
+            data,
+            pd.DataFrame(
+                data.start_location.apply(lambda p: (p.x, p.y)).to_list(),
+                columns=["start_longitude", "start_latitude"],
+                index=data.index,
+            ),
+            pd.DataFrame(
+                data.end_location.apply(lambda p: (p.x, p.y)).to_list(),
+                columns=["end_longitude", "end_latitude"],
+                index=data.index,
+            ),
+        ],
+        axis=1,
+    )
     data = data.drop(columns=["start_location", "end_location"])
     data = data.set_crs("EPSG:2845").to_crs("EPSG:3857")
     sdf = spd.GeoDataFrame(data)
     return sdf
+
+
+def append_traj_info(
+    df: spd.GeoDataFrame,
+    paths: Dict[str, str],
+) -> spd.GeoDataFrame:
+    """Append trajectory info from shape files.
+
+    Parameters
+    ----------
+    df
+        DataFrame containing trajectories.
+    paths
+        Dict containing the following paths:
+            - tracts
+            - tsz
+            - city
+            - county
+
+    Returns
+    -------
+    Dataframe with appended information.
+
+    """
+    df = df.reset_index(drop=True)
+    start_locations = gpd.GeoDataFrame(
+        geometry=df.start_geohash.apply(geohash_decode_point),
+        index=df.index,
+        crs="EPSG:4326",
+    )
+    end_locations = gpd.GeoDataFrame(
+        geometry=df.end_geohash.apply(geohash_decode_point),
+        index=df.index,
+        crs="EPSG:4326",
+    )
+
+    tracts = gpd.read_file(paths["tracts"]).to_crs("EPSG:4326")
+    df["start_CensusBlock2019"] = (
+        gpd.sjoin(
+            start_locations,
+            tracts[["geometry", "GEOID"]].set_index("GEOID"),
+            how="left",
+        )
+        .rename(columns={"index_right": "start_CensusBlock2019"})
+        .drop(columns=["geometry"])
+        .fillna("unknown")["start_CensusBlock2019"]
+        .pipe(lambda s: s.groupby(s.index).head(1))
+    )
+    df["end_CensusBlock2019"] = (
+        gpd.sjoin(
+            end_locations,
+            tracts[["geometry", "GEOID"]].set_index("GEOID"),
+            how="left",
+        )
+        .rename(columns={"index_right": "end_CensusBlock2019"})
+        .drop(columns=["geometry"])
+        .fillna("unknown")["end_CensusBlock2019"]
+        .pipe(lambda s: s.groupby(s.index).head(1))
+    )
+
+    tsz = gpd.read_file(paths["tsz"]).to_crs("EPSG:4326")
+    df["start_TSZ"] = (
+        gpd.sjoin(
+            start_locations,
+            tsz[["geometry", "TSZ"]].set_index("TSZ"),
+            how="left",
+        )
+        .rename(columns={"index_right": "start_TSZ"})
+        .drop(columns=["geometry"])
+        .fillna("Out of NCTCOG area")["start_TSZ"]
+        .pipe(lambda s: s.groupby(s.index).head(1))
+    )
+    df["end_TSZ"] = (
+        gpd.sjoin(
+            end_locations,
+            tsz[["geometry", "TSZ"]].set_index("TSZ"),
+            how="left",
+        )
+        .rename(columns={"index_right": "end_TSZ"})
+        .drop(columns=["geometry"])
+        .fillna("Out of NCTCOG area")["end_TSZ"]
+        .pipe(lambda s: s.groupby(s.index).head(1))
+    )
+
+    county = gpd.read_file(paths["county"])  # File already in EPSG:4326
+    df["start_county"] = (
+        gpd.sjoin(
+            start_locations,
+            county[["geometry", "CNTY_NM"]].set_index("CNTY_NM"),
+            how="left",
+        )
+        .rename(columns={"index_right": "start_county"})
+        .drop(columns=["geometry"])
+        .fillna("unknown")["start_county"]
+        .pipe(lambda s: s.groupby(s.index).head(1))
+    )
+    df["end_county"] = (
+        gpd.sjoin(
+            end_locations,
+            county[["geometry", "CNTY_NM"]].set_index("CNTY_NM"),
+            how="left",
+        )
+        .rename(columns={"index_right": "end_county"})
+        .drop(columns=["geometry"])
+        .fillna("unknown")["end_county"]
+        .pipe(lambda s: s.groupby(s.index).head(1))
+    )
+
+    city = gpd.read_file(paths["city"])  # File already in EPSG:4326
+    df["start_city"] = (
+        gpd.sjoin(
+            start_locations,
+            city[["geometry", "CITY_NM"]].set_index("CITY_NM"),
+            how="left",
+        )
+        .rename(columns={"index_right": "start_city"})
+        .drop(columns=["geometry"])
+        .fillna("unknown")["start_city"]
+        .pipe(lambda s: s.groupby(s.index).head(1))
+    )
+    df["end_city"] = (
+        gpd.sjoin(
+            end_locations,
+            city[["geometry", "CITY_NM"]].set_index("CITY_NM"),
+            how="left",
+        )
+        .rename(columns={"index_right": "end_city"})
+        .drop(columns=["geometry"])
+        .fillna("unknown")["end_city"]
+        .pipe(lambda s: s.groupby(s.index).head(1))
+    )
+
+    return df
+
+
+def split_device_trajectories(
+    file: PathType,
+    output: PathType,
+    paths: Dict[str, str],
+    **kwargs,
+) -> None:
+    """Split device trajectories.
+
+    Parameters
+    ----------
+    file: PathType
+        Single parquet file containing device observations.
+    output: PathType
+        Base path for output.
+    paths:
+        Dict of paths for `append_traj_info`.
+
+    """
+    out = f"{output}/device_{file.split('.')[-2]}.parquet"
+    if exists(out):
+        return None
+    df = pd.read_parquet(file)
+    if len(df) < 2:
+        return None
+    tc = split_trajectories(df, **kwargs)
+    sdf = extract_traj_info(tc)
+    sdf = append_traj_info(sdf, paths)
+    to_parquet(sdf, out)
 
 
 def load_trajectory_table(root_path, year, month, espg=2845, head=None):
@@ -403,26 +605,26 @@ class ODViewer(param.Parameterized):
         )
 
 class TripSegmentation(param.Parameterized):
-    
+
     device_selector = param.ObjectSelector(label='Select a Device')
     trip_table = param.DataFrame()
     source_data = param.DataFrame()
     single_device_trips = param.DataFrame()
-    
+
     plot_height = 800
     plot_width =1000
-    
+
     max_diameter = param.Integer(default=30, label='Stop diameter (meters)')
     min_duration = param.Integer(default=5, label='Stop time (min)')
     gap = param.Integer(default=60, label='Trip gap time (min)')
-    
+
     action = param.Action(lambda x: x.param.trigger('action'), label='Recompute Trips')
-    
+
     def __init__(self, source_data, **params):
         super().__init__(source_data=source_data, **params)
 
         self.source_data = source_data
-        
+
         # process the source files to get the trip table
         self.process_trajectories()
 
@@ -436,7 +638,7 @@ class TripSegmentation(param.Parameterized):
 
     @param.depends('action', watch=True)
     def process_trajectories(self):
-        
+
         self.trip_table = split_trajectories(self.source_data, max_diameter=self.max_diameter,  min_duration=timedelta(minutes=self.min_duration), gap=timedelta(minutes=self.gap))
         self.reset_device_dropdown()
 
@@ -450,7 +652,7 @@ class TripSegmentation(param.Parameterized):
         explicit_map = {}
         for idx, traj in enumerate(single['traj_id']):
             explicit_map[traj] = cc.palette.glasbey_bw[idx]
-            
+
         # construct plots for each trip
         path_plts = []
         for traj in single['traj_id']:
@@ -458,9 +660,9 @@ class TripSegmentation(param.Parameterized):
             path_plts.append(gv.Path(geom, crs=ccrs.GOOGLE_MERCATOR).opts(color=explicit_map[traj]))
         # overlay the plots on tiles
         plt = gvts.CartoLight() * hv.Overlay(path_plts)
-        
+
         return plt.opts(height=self.plot_height, width=self.plot_width)
-        
+
     def panel(self):
         return pn.Column(
             pn.Accordion(
@@ -483,6 +685,5 @@ class TripSegmentation(param.Parameterized):
                     ),
                 ),
             ),
-        
+
         )
-    
