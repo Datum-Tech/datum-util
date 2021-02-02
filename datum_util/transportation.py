@@ -266,8 +266,8 @@ def append_traj_info(
 
 
 def split_device_trajectories(
-    file: PathType,
-    output: PathType,
+    file: str,
+    output: str,
     paths: Dict[str, str],
     study: spd.GeoDataFrame,
     **kwargs,
@@ -276,9 +276,9 @@ def split_device_trajectories(
 
     Parameters
     ----------
-    file: PathType
+    file: str
         Single parquet file containing device observations.
-    output: PathType
+    output: str
         Base path for output.
     paths:
         Dict of paths for `append_traj_info`.
@@ -287,7 +287,7 @@ def split_device_trajectories(
     out = f"{output}/device_{file.split('.')[-2]}.parquet"
     if exists(out):
         return None
-    df = pd.read_parquet(file)
+    df = read_parquet(file)[["device_id", "latitude", "longitude", "timestamp"]]
     if len(df) < 2:
         return None
     tc = split_trajectories(df, **kwargs)
