@@ -95,6 +95,9 @@ def extract_traj_info(tc: mpd.TrajectoryCollection) -> spd.GeoDataFrame:
     )
     data["device_id"] = data.traj_id.str.split("-").str[-1]
     data["duration"] = data.duration.dt.seconds / 60
+    data["pings"] = data.geometry.apply(lambda shp: len(shp.coords))
+    data["time_density"] = data.pings / data.duration
+    data["spatial_density"] = data.pings / data.length
     data["start_location"] = (
         gpd.GeoDataFrame(dict(geometry=data.start_location))
         .set_crs("EPSG:2845")
@@ -266,6 +269,7 @@ def split_device_trajectories(
     file: PathType,
     output: PathType,
     paths: Dict[str, str],
+    study: spd.GeoDataFrame,
     **kwargs,
 ) -> None:
     """Split device trajectories.
@@ -288,6 +292,7 @@ def split_device_trajectories(
         return None
     tc = split_trajectories(df, **kwargs)
     sdf = extract_traj_info(tc)
+    sdf = spd.sjoin(sdf, study).drop(columns=["index_right"])
     sdf = append_traj_info(sdf, paths)
     to_parquet(sdf, out)
 
