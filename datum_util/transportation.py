@@ -685,3 +685,88 @@ class TripSegmentation(param.Parameterized):
             ),
 
         )
+
+class Histogram_Explorer(param.Parameterized):
+    df_raw = param.DataFrame()
+    df_binned = param.DataFrame()
+    
+    start_date = param.Date(default=dt.datetime(2019, 9, 1))
+    end_date = param.Date(default=dt.datetime(2019, 10, 1))
+    
+    bin_frequency = param.ObjectSelector()
+
+    plot_width = param.Integer(default=800)
+    plot_height = param.Integer(default=800)
+    
+    action = param.Action(lambda x: x.param.trigger('action'), label='Recompute Histogram')
+    
+    
+    def __init__(self, df_raw, start_date, end_date, **params):
+        super().__init__(df_raw=df_raw, start_date=start_date, end_date=end_date, **params)
+        
+        self.start_date = start_date
+        self.end_date = end_date
+    
+        # define bin options
+        self.bin_params = {
+            'daily': {
+                'freq': '1D',
+                'bins_per_day': 1,
+            },
+            'hourly': {
+                'freq': '1H',
+                'bins_per_day': 24,
+            },
+            '15 minute': {
+                'freq': '15min',
+                'bins_per_day': 96
+            }
+        }
+        
+        self.param.bin_frequency.objects = list(self.bin_params)
+        self.bin_frequency = list(self.bin_params)[0]
+        
+        # mapping between datetime weekday notation and text labels
+        self.weekdays = {
+            0: 'Monday',
+            1: 'Tuesday',
+            2: 'Wednesday',
+            3: 'Thursday',
+            4: 'Friday',
+            5: 'Saturday',
+            6: 'Sunday',
+        }
+        
+        # format for date range display
+        self.date_range_format = '%m-%d-%Y %H:%M:%S'
+   
+    
+    def bin_dataset(self):
+        
+        # calculate total number of days
+        num_days = (self.end_date - self.start_date).days
+        # calculate the number of bins
+        self.num_bins = int(num_days * self.bin_params[self.bin_frequency]['bins_per_day'])
+
+        # groupby timestamp and device id to remove duplicate devices in each bin
+        self.df_binned = self.df_raw.groupby([pd.Grouper(key='timestamp', freq=self.bin_params[self.bin_frequency]['freq']), 'device_id']).count().reset_index()
+    
+    @param.depends('action')
+    def plot_histogram(self):
+        
+        self.bin_dataset()
+        # construct date range string for plot title
+        display_range = f'{self.weekdays[self.start_date.weekday()]} {self.start_date.strftime(self.date_range_format)} to {self.weekdays[self.end_date.weekday()]} {self.end_date.strftime(self.date_range_format)}'
+
+        plt = df.hvplot.hist(y='timestamp', bins=self.num_bins, bin_range=(self.start_date, self.end_date), title=display_range).opts(hv.opts.Histogram(alpha=0.7))
+        
+        return plt
+    
+    def panel(self):
+        return pn.Column(
+            self.param.start_date,
+            self.param.end_date,
+            self.param.bin_frequency,
+            self.param.action,
+            self.plot_histogram,
+        )
