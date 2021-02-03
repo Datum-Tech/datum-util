@@ -95,6 +95,9 @@ def extract_traj_info(tc: mpd.TrajectoryCollection) -> spd.GeoDataFrame:
     )
     data["device_id"] = data.traj_id.str.split("-").str[-1]
     data["duration"] = data.duration.dt.seconds / 60
+    data["pings"] = data.geometry.apply(lambda shp: len(shp.coords))
+    data["time_density"] = data.pings / data.duration
+    data["spatial_density"] = data.pings / data.length
     data["start_location"] = (
         gpd.GeoDataFrame(dict(geometry=data.start_location))
         .set_crs("EPSG:2845")
@@ -263,18 +266,19 @@ def append_traj_info(
 
 
 def split_device_trajectories(
-    file: PathType,
-    output: PathType,
+    file: str,
+    output: str,
     paths: Dict[str, str],
+    study: spd.GeoDataFrame,
     **kwargs,
 ) -> None:
     """Split device trajectories.
 
     Parameters
     ----------
-    file: PathType
+    file: str
         Single parquet file containing device observations.
-    output: PathType
+    output: str
         Base path for output.
     paths:
         Dict of paths for `append_traj_info`.
@@ -283,11 +287,12 @@ def split_device_trajectories(
     out = f"{output}/device_{file.split('.')[-2]}.parquet"
     if exists(out):
         return None
-    df = pd.read_parquet(file)
+    df = read_parquet(file)[["device_id", "latitude", "longitude", "timestamp"]]
     if len(df) < 2:
         return None
     tc = split_trajectories(df, **kwargs)
     sdf = extract_traj_info(tc)
+    sdf = spd.sjoin(sdf, study).drop(columns=["index_right"])
     sdf = append_traj_info(sdf, paths)
     to_parquet(sdf, out)
 
