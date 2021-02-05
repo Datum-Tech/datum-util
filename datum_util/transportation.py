@@ -138,7 +138,7 @@ def extract_traj_info(tc: mpd.TrajectoryCollection) -> gpd.GeoDataFrame:
 
 def append_traj_info(
     df: spd.GeoDataFrame,
-    gdfs: Dict[str, Any],
+    gdfs: Dict[str, gpd.GeoDataFrame],
 ) -> spd.GeoDataFrame:
     """Append trajectory info from shape files.
 
@@ -146,7 +146,7 @@ def append_traj_info(
     ----------
     df
         DataFrame containing trajectories.
-    paths
+    gdfs
         Dict containing the following GeoPandas GeoDataFrames:
             - tracts
             - tsz
@@ -179,6 +179,7 @@ def append_traj_info(
         )
         .rename(columns={"index_right": "start_CensusBlock2019"})
         .drop(columns=["geometry"])
+        .astype(str)
         .fillna("unknown")["start_CensusBlock2019"]
         .pipe(lambda s: s.groupby(s.index).head(1))
     )
@@ -190,6 +191,7 @@ def append_traj_info(
         )
         .rename(columns={"index_right": "end_CensusBlock2019"})
         .drop(columns=["geometry"])
+        .astype(str)
         .fillna("unknown")["end_CensusBlock2019"]
         .pipe(lambda s: s.groupby(s.index).head(1))
     )
@@ -203,6 +205,7 @@ def append_traj_info(
         )
         .rename(columns={"index_right": "start_TSZ"})
         .drop(columns=["geometry"])
+        .astype(str)
         .fillna("Out of NCTCOG area")["start_TSZ"]
         .pipe(lambda s: s.groupby(s.index).head(1))
     )
@@ -214,6 +217,7 @@ def append_traj_info(
         )
         .rename(columns={"index_right": "end_TSZ"})
         .drop(columns=["geometry"])
+        .astype(str)
         .fillna("Out of NCTCOG area")["end_TSZ"]
         .pipe(lambda s: s.groupby(s.index).head(1))
     )
