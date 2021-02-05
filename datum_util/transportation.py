@@ -1,10 +1,9 @@
 """Transportation analysis utilities."""
-
 import datetime as dt
 import logging
 from copy import deepcopy
 from datetime import timedelta
-from typing import Dict
+from typing import Any, Dict
 
 import cartopy.crs as ccrs
 import colorcet as cc
@@ -52,7 +51,7 @@ def split_trajectories(
     return all_stops
 
 
-def extract_traj_info(tc: mpd.TrajectoryCollection) -> spd.GeoDataFrame:
+def extract_traj_info(tc: mpd.TrajectoryCollection) -> gpd.GeoDataFrame:
     """Extract trajectory information from collection."""
     dfs = []
     for traj in tc.trajectories:
@@ -99,13 +98,19 @@ def extract_traj_info(tc: mpd.TrajectoryCollection) -> spd.GeoDataFrame:
     data["time_density"] = data.pings / data.duration
     data["spatial_density"] = data.pings / data.length
     data["start_location"] = (
-        gpd.GeoDataFrame(dict(geometry=data.start_location))
+        gpd.GeoDataFrame(
+            dict(geometry=data.start_location),
+            index=data.index,
+        )
         .set_crs("EPSG:2845")
         .to_crs("EPSG:4326")
     )
     data["start_geohash"] = data["start_location"].apply(geohash_encode_point)
     data["end_location"] = (
-        gpd.GeoDataFrame(dict(geometry=data.end_location))
+        gpd.GeoDataFrame(
+            dict(geometry=data.end_location),
+            index=data.index,
+        )
         .set_crs("EPSG:2845")
         .to_crs("EPSG:4326")
     )
@@ -128,13 +133,12 @@ def extract_traj_info(tc: mpd.TrajectoryCollection) -> spd.GeoDataFrame:
     )
     data = data.drop(columns=["start_location", "end_location"])
     data = data.set_crs("EPSG:2845").to_crs("EPSG:3857")
-    sdf = spd.GeoDataFrame(data)
-    return sdf
+    return data
 
 
 def append_traj_info(
     df: spd.GeoDataFrame,
-    paths: Dict[str, str],
+    gdfs: Dict[str, Any],
 ) -> spd.GeoDataFrame:
     """Append trajectory info from shape files.
 
@@ -143,7 +147,7 @@ def append_traj_info(
     df
         DataFrame containing trajectories.
     paths
-        Dict containing the following paths:
+        Dict containing the following GeoPandas GeoDataFrames:
             - tracts
             - tsz
             - city
@@ -166,7 +170,7 @@ def append_traj_info(
         crs="EPSG:4326",
     )
 
-    tracts = gpd.read_file(paths["tracts"]).to_crs("EPSG:4326")
+    tracts = gdfs["tracts"].to_crs("EPSG:4326")
     df["start_CensusBlock2019"] = (
         gpd.sjoin(
             start_locations,
@@ -190,7 +194,7 @@ def append_traj_info(
         .pipe(lambda s: s.groupby(s.index).head(1))
     )
 
-    tsz = gpd.read_file(paths["tsz"]).to_crs("EPSG:4326")
+    tsz = gdfs["tsz"].to_crs("EPSG:4326")
     df["start_TSZ"] = (
         gpd.sjoin(
             start_locations,
@@ -214,7 +218,7 @@ def append_traj_info(
         .pipe(lambda s: s.groupby(s.index).head(1))
     )
 
-    county = gpd.read_file(paths["county"])  # File already in EPSG:4326
+    county = gdfs["county"]  # File already in EPSG:4326
     df["start_county"] = (
         gpd.sjoin(
             start_locations,
@@ -238,7 +242,7 @@ def append_traj_info(
         .pipe(lambda s: s.groupby(s.index).head(1))
     )
 
-    city = gpd.read_file(paths["city"])  # File already in EPSG:4326
+    city = gdfs["city"]  # File already in EPSG:4326
     df["start_city"] = (
         gpd.sjoin(
             start_locations,
@@ -268,32 +272,26 @@ def append_traj_info(
 def split_device_trajectories(
     file: str,
     output: str,
-    paths: Dict[str, str],
-    study: spd.GeoDataFrame,
-    **kwargs,
+    study: gpd.GeoDataFrame,
+    split_opts: Dict[str, Any],
+    min_length: float,
+    min_duration: float,
 ) -> None:
-    """Split device trajectories.
-
-    Parameters
-    ----------
-    file: str
-        Single parquet file containing device observations.
-    output: str
-        Base path for output.
-    paths:
-        Dict of paths for `append_traj_info`.
-
-    """
+    """Split device trajectories."""
     out = f"{output}/device_{file.split('.')[-2]}.parquet"
     if exists(out):
         return None
-    df = read_parquet(file)[["device_id", "latitude", "longitude", "timestamp"]]
+    df = read_parquet(file)[[
+        "device_id", "latitude", "longitude", "timestamp"
+    ]]
     if len(df) < 2:
         return None
-    tc = split_trajectories(df, **kwargs)
-    sdf = extract_traj_info(tc)
-    sdf = spd.sjoin(sdf, study).drop(columns=["index_right"])
-    sdf = append_traj_info(sdf, paths)
+    tc = split_trajectories(df, **split_opts)
+    gdf = extract_traj_info(tc)
+    gdf = gdf[(gdf["length"] >= min_length)
+              & (gdf["duration"] >= min_duration)]
+    gdf = gpd.sjoin(gdf, study).drop(columns=["index_right"])
+    sdf = spd.GeoDataFrame(gdf)
     to_parquet(sdf, out)
 
 
@@ -694,24 +692,24 @@ class TripSegmentation(param.Parameterized):
 class Histogram_Explorer(param.Parameterized):
     df_raw = param.DataFrame()
     df_binned = param.DataFrame()
-    
+
     start_date = param.Date(default=dt.datetime(2019, 9, 1))
     end_date = param.Date(default=dt.datetime(2019, 10, 1))
-    
+
     bin_frequency = param.ObjectSelector()
 
     plot_width = param.Integer(default=800)
     plot_height = param.Integer(default=800)
-    
+
     action = param.Action(lambda x: x.param.trigger('action'), label='Recompute Histogram')
-    
-    
+
+
     def __init__(self, df_raw, start_date, end_date, **params):
         super().__init__(df_raw=df_raw, start_date=start_date, end_date=end_date, **params)
-        
+
         self.start_date = start_date
         self.end_date = end_date
-    
+
         # define bin options
         self.bin_params = {
             'daily': {
@@ -727,10 +725,10 @@ class Histogram_Explorer(param.Parameterized):
                 'bins_per_day': 96
             }
         }
-        
+
         self.param.bin_frequency.objects = list(self.bin_params)
         self.bin_frequency = list(self.bin_params)[0]
-        
+
         # mapping between datetime weekday notation and text labels
         self.weekdays = {
             0: 'Monday',
@@ -741,13 +739,13 @@ class Histogram_Explorer(param.Parameterized):
             5: 'Saturday',
             6: 'Sunday',
         }
-        
+
         # format for date range display
         self.date_range_format = '%m-%d-%Y %H:%M:%S'
-   
-    
+
+
     def bin_dataset(self):
-        
+
         # calculate total number of days
         num_days = (self.end_date - self.start_date).days
         # calculate the number of bins
@@ -755,18 +753,18 @@ class Histogram_Explorer(param.Parameterized):
 
         # groupby timestamp and device id to remove duplicate devices in each bin
         self.df_binned = self.df_raw.groupby([pd.Grouper(key='timestamp', freq=self.bin_params[self.bin_frequency]['freq']), 'device_id']).count().reset_index()
-    
+
     @param.depends('action')
     def plot_histogram(self):
-        
+
         self.bin_dataset()
         # construct date range string for plot title
         display_range = f'{self.weekdays[self.start_date.weekday()]} {self.start_date.strftime(self.date_range_format)} to {self.weekdays[self.end_date.weekday()]} {self.end_date.strftime(self.date_range_format)}'
 
         plt = df.hvplot.hist(y='timestamp', bins=self.num_bins, bin_range=(self.start_date, self.end_date), title=display_range).opts(hv.opts.Histogram(alpha=0.7))
-        
+
         return plt
-    
+
     def panel(self):
         return pn.Column(
             self.param.start_date,
