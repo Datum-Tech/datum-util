@@ -96,6 +96,26 @@ def hvplot_geohash_parents(
     return points * boxes
 
 
+def hvplot_geohashes_type(
+    geohashes: Iterable[str],
+    type: str = "points",
+    *args,
+    **kwargs,
+):
+    """Plot geohashes."""
+    if type == "points":
+        func = geohash_decode_point
+    elif type == "boxes":
+        func = geohash_to_box
+    geohashes = pd.Series(geohashes)
+    gdf = gpd.GeoDataFrame(
+        dict(
+            geometry=geohashes.apply(func),
+            geohash=geohashes,
+        ))
+    return gdf.hvplot(*args, **kwargs)
+
+
 def hvplot_geohashes(
     geohashes: Iterable[str],
     *args,
